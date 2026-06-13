@@ -9,8 +9,8 @@ source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxV
 APP="Grimmory"
 var_tags="${var_tags:-books;library}"
 var_cpu="${var_cpu:-3}"
-var_ram="${var_ram:-3072}"
-var_disk="${var_disk:-7}"
+var_ram="${var_ram:-6144}"
+var_disk="${var_disk:-10}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-13}"
 var_unprivileged="${var_unprivileged:-1}"
@@ -19,6 +19,157 @@ header_info "$APP"
 variables
 color
 catch_errors
+
+
+function normalize_grimmory_release() {
+  local release
+  release="$(get_latest_github_release "grimmory-tools/grimmory")"
+  release="${release#v}"
+
+  if [[ -z "$release" ]]; then
+    msg_error "Unable to determine the latest Grimmory release"
+    return 1
+  fi
+
+  GRIMMORY_VERSION="v${release}"
+  GRIMMORY_VERSION_CLEAN="${release}"
+  GRIMMORY_REVISION="unknown"
+}
+
+function setup_libarchive_link() {
+  local LIBARCHIVE_TARGET=""
+  local CANDIDATE
+
+  for CANDIDATE in \
+    /usr/lib/*/libarchive.so.13 \
+    /lib/*/libarchive.so.13 \
+    /usr/lib/libarchive.so.13; do
+    if [[ -e "$CANDIDATE" ]]; then
+      LIBARCHIVE_TARGET="$CANDIDATE"
+      break
+    fi
+  done
+
+  if [[ -z "$LIBARCHIVE_TARGET" ]]; then
+    msg_error "libarchive.so.13 was not found after installing libarchive13"
+    return 1
+  fi
+
+  mkdir -p /usr/lib
+  if [[ -e /usr/lib/libarchive.so && ! -L /usr/lib/libarchive.so ]]; then
+    msg_warn "/usr/lib/libarchive.so already exists and is not a symlink; leaving it unchanged"
+  elif [[ ! -e /usr/lib/libarchive.so ]]; then
+    ln -s "$LIBARCHIVE_TARGET" /usr/lib/libarchive.so
+  fi
+}
+
+function ensure_env_kv() {
+  local FILE="$1"
+  local KEY="$2"
+  local VALUE="$3"
+
+  mkdir -p "$(dirname "$FILE")"
+  touch "$FILE"
+
+  if grep -qE "^${KEY}=" "$FILE"; then
+    sed -i "s|^${KEY}=.*|${KEY}=${VALUE}|" "$FILE"
+  else
+    echo "${KEY}=${VALUE}" >> "$FILE"
+  fi
+}
+
+function upsert_service_line() {
+  local FILE="$1"
+  local MATCH_REGEX="$2"
+  local LINE="$3"
+  local TMP
+
+  if ! grep -q '^\[Service\]$' "$FILE"; then
+    msg_error "Unable to update $FILE: missing [Service] section"
+    return 1
+  fi
+
+  TMP="$(mktemp)"
+  awk -v regex="$MATCH_REGEX" -v line="$LINE" '
+    BEGIN { in_service=0; added=0 }
+    /^\[Service\]$/ {
+      print
+      if (!added) {
+        print line
+        added=1
+      }
+      in_service=1
+      next
+    }
+    /^\[/ { in_service=0 }
+    in_service && $0 ~ regex { next }
+    { print }
+  ' "$FILE" > "$TMP"
+  cat "$TMP" > "$FILE"
+  rm -f "$TMP"
+}
+
+
+function run_long_command() {
+  local NAME="$1"
+  shift
+  local LOG_FILE="/tmp/grimmory-${NAME}.log"
+  local PID
+  local RC
+  local OLD_HUP_TRAP
+  local OLD_ERREXIT="off"
+
+  msg_info "Running ${NAME} (log: ${LOG_FILE})"
+  rm -f "$LOG_FILE"
+
+  # community-scripts installs a SIGHUP trap. Angular builds can be quiet for long
+  # stretches, and in some LXC/helper contexts the child process gets HUP'd before
+  # it can print a real build error. Ignore HUP only while this long command runs.
+  OLD_HUP_TRAP="$(trap -p HUP || true)"
+  case "$-" in
+    *e*) OLD_ERREXIT="on" ;;
+  esac
+
+  trap '' HUP
+
+  (
+    trap '' HUP
+    echo "[$(date -Is)] Command: $*"
+    echo "[$(date -Is)] MemTotal: $(awk '/^MemTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
+    echo "[$(date -Is)] SwapTotal: $(awk '/^SwapTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
+    echo "[$(date -Is)] Disk free at /opt/grimmory: $(df -h /opt/grimmory 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || true)"
+    exec nohup "$@" </dev/null
+  ) >"$LOG_FILE" 2>&1 &
+  PID=$!
+
+  while kill -0 "$PID" >/dev/null 2>&1; do
+    sleep 15
+    echo -n "."
+  done
+  echo
+
+  # Do not let set -e / ERR trap short-circuit our log printing.
+  set +e
+  wait "$PID"
+  RC=$?
+  if [[ "$OLD_ERREXIT" == "on" ]]; then
+    set -e
+  fi
+
+  if [[ -n "$OLD_HUP_TRAP" ]]; then
+    eval "$OLD_HUP_TRAP"
+  else
+    trap - HUP
+  fi
+
+  if [[ "$RC" -ne 0 ]]; then
+    msg_warn "${NAME} failed with exit code ${RC}; showing the last 200 log lines"
+    tail -n 200 "$LOG_FILE" || true
+    return "$RC"
+  fi
+
+  msg_ok "${NAME} completed"
+}
 
 function setup_kepubify() {
   local OLD_PATH="/opt/booklore_storage/data/tools/kepubify"
@@ -116,17 +267,20 @@ function update_script() {
   # --- FORCE REINSTALL ENABLED ---
   JAVA_VERSION="25"
   setup_java
-  NODE_VERSION="22"
+  NODE_VERSION="24"
   setup_nodejs
   setup_mariadb
   setup_yq
   ensure_dependencies ffmpeg libarchive13
   setup_kepubify
   
-  # Confirm libarchive symlink
-  if [[ ! -L /usr/lib/libarchive.so ]]; then
-    ln -s /lib/x86_64-linux-gnu/libarchive.so /usr/lib/
-  fi
+  # Grimmory 3.x native archive support expects libarchive.so to resolve.
+  setup_libarchive_link
+
+  EXISTING_BOOKLORE_PORT="$(grep -E '^BOOKLORE_PORT=' /opt/booklore_storage/.env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+
+  # Resolve the release once and use it for download, build metadata, and systemd runtime metadata.
+  normalize_grimmory_release
 
   # Service stop:
   msg_info "Stopping Service"
@@ -158,12 +312,12 @@ function update_script() {
   msg_ok "Backed up old installation"
 
   # Wipe existing grimmory dir before fresh deploy
-  msg_info "Downloading fresh source code"
+  msg_info "Downloading fresh source code (${GRIMMORY_VERSION})"
   rm -rf /opt/grimmory
   mkdir -p /opt/grimmory
   
-  # Manually fetch the tarball to bypass "up-to-date" check in the helper function
-  TARBALL_URL="https://github.com/grimmory-tools/grimmory/tarball/main"
+  # Fetch the latest release tag instead of the moving main/develop branch.
+  TARBALL_URL="https://github.com/grimmory-tools/grimmory/archive/refs/tags/${GRIMMORY_VERSION}.tar.gz"
   curl -fsSL "$TARBALL_URL" -o /tmp/grimmory.tar.gz
   tar -xzf /tmp/grimmory.tar.gz -C /opt/grimmory --strip-components=1
   rm -f /tmp/grimmory.tar.gz
@@ -176,27 +330,51 @@ function update_script() {
   fi
   cd /opt/grimmory/frontend || exit 1
   
-  # --- FIX: ChartJS Matrix Resolution & Stability ---
-  rm -rf node_modules package-lock.json
-  npm cache clean --force
-  
-  msg_info "Ensuring ChartJS Matrix stability (v2.1.1)..."
-  npm install chartjs-chart-matrix@2.1.1 --save-exact --no-audit --no-fund
-  
-  if [[ ! -f "node_modules/chartjs-chart-matrix/dist/chartjs-chart-matrix.esm.js" ]]; then
-    msg_error "CRITICAL: Required chartjs-chart-matrix file not found after install."
-    return 1
-  fi
-  # ---------------------------------------------------
+  rm -rf node_modules .angular/cache
+  corepack enable
+  $STD corepack prepare yarn@4.10.3 --activate
 
-  npm run build --configuration=production
+  # Keep the install/build resilient inside pct/Proxmox helper sessions.
+  # The Dockerfile uses these same CI and Angular analytics flags for production builds.
+  if ! run_long_command frontend-install corepack yarn install --immutable; then
+    msg_error "Frontend dependency install failed. See /tmp/grimmory-frontend-install.log"
+    exit 1
+  fi
+
+  local MEM_MB
+  local NODE_HEAP_MB
+  MEM_MB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB > 0 )); then
+    NODE_HEAP_MB=$((MEM_MB * 55 / 100))
+    (( NODE_HEAP_MB < 2048 )) && NODE_HEAP_MB=2048
+    (( NODE_HEAP_MB > 4096 )) && NODE_HEAP_MB=4096
+  else
+    NODE_HEAP_MB=3072
+  fi
+
+  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB < 4096 )); then
+    msg_warn "Detected only ${MEM_MB} MB RAM. Grimmory 3.2.0 frontend builds may need at least 4 GB; 6 GB is safer."
+  fi
+
+  export NODE_OPTIONS="--max-old-space-size=${NODE_HEAP_MB}"
+  export YARN_ENABLE_TELEMETRY=0
+  export CI=1
+  export NG_CLI_ANALYTICS=false
+  export NG_BUILD_MAX_WORKERS=2
+
+  if ! run_long_command frontend-build corepack yarn ng build --configuration production --progress=false; then
+    msg_error "Frontend build failed. See /tmp/grimmory-frontend-build.log"
+    exit 1
+  fi
+
+  unset CI NG_CLI_ANALYTICS YARN_ENABLE_TELEMETRY NODE_OPTIONS NG_BUILD_MAX_WORKERS
   msg_ok "Built Frontend"
 
   # Backend build:
   msg_info "Building Backend"
   cd /opt/grimmory/backend || exit 1
-  APP_VERSION=$(get_latest_github_release "grimmory-tools/grimmory")
-  $STD yq eval ".app.version = \"${APP_VERSION}\"" -i src/main/resources/application.yaml
+  export APP_VERSION="${GRIMMORY_VERSION}"
+  export APP_REVISION="${GRIMMORY_REVISION}"
   $STD ./gradlew clean bootJar -PfrontendDistDir=/opt/grimmory/frontend/dist/grimmory/browser -x test --no-daemon
 
   mkdir -p /opt/grimmory/dist
@@ -216,10 +394,8 @@ function update_script() {
     msg_ok "Removed Nginx"
   fi
 
-  # SERVER_PORT injection:
-  if ! grep -q "^SERVER_PORT=" /opt/booklore_storage/.env 2>/dev/null; then
-    echo "SERVER_PORT=6060" >> /opt/booklore_storage/.env
-  fi
+  # Grimmory still reads BOOKLORE_PORT in application.yaml.
+  ensure_env_kv /opt/booklore_storage/.env BOOKLORE_PORT "${EXISTING_BOOKLORE_PORT:-6060}"
 
   if [[ -f /etc/systemd/system/booklore.service && ! -f /etc/systemd/system/grimmory.service ]]; then
     mv /etc/systemd/system/booklore.service /etc/systemd/system/grimmory.service
@@ -231,8 +407,18 @@ function update_script() {
     exit
   fi
 
-  sed -i 's|WorkingDirectory=.*|WorkingDirectory=/opt/grimmory/dist|' /etc/systemd/system/grimmory.service
-  sed -i 's|ExecStart=.*|ExecStart=/usr/bin/java --enable-preview -XX:+UseG1GC -XX:+UseStringDeduplication -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError -jar /opt/grimmory/dist/app.jar|' /etc/systemd/system/grimmory.service
+  JAVA_TOOL_OPTIONS="-XX:+UseShenandoahGC -XX:ShenandoahGCHeuristics=compact -XX:+UseCompactObjectHeaders -XX:MaxRAMPercentage=60.0 -XX:InitialRAMPercentage=8.0 -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heapdump.hprof -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=48m -Xss512k -XX:CICompilerCount=2 -XX:+UnlockExperimentalVMOptions -XX:+UseStringDeduplication -XX:ShenandoahUncommitDelay=5000 -XX:ShenandoahGuaranteedGCInterval=30000 -XX:MaxDirectMemorySize=256m --enable-native-access=ALL-UNNAMED --enable-preview"
+
+  upsert_service_line /etc/systemd/system/grimmory.service '^EnvironmentFile=.*booklore_storage/\.env' 'EnvironmentFile=-/opt/booklore_storage/.env'
+  SERVICE_APP_VERSION_LINE="Environment=\"APP_VERSION=${GRIMMORY_VERSION}\""
+  SERVICE_APP_REVISION_LINE="Environment=\"APP_REVISION=${GRIMMORY_REVISION}\""
+  SERVICE_JAVA_TOOL_OPTIONS_LINE="Environment=\"JAVA_TOOL_OPTIONS=${JAVA_TOOL_OPTIONS}\""
+
+  upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?APP_VERSION=' "$SERVICE_APP_VERSION_LINE"
+  upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?APP_REVISION=' "$SERVICE_APP_REVISION_LINE"
+  upsert_service_line /etc/systemd/system/grimmory.service '^Environment="?JAVA_TOOL_OPTIONS=' "$SERVICE_JAVA_TOOL_OPTIONS_LINE"
+  upsert_service_line /etc/systemd/system/grimmory.service '^WorkingDirectory=' 'WorkingDirectory=/opt/grimmory/dist'
+  upsert_service_line /etc/systemd/system/grimmory.service '^ExecStart=' 'ExecStart=/usr/bin/java --enable-native-access=ALL-UNNAMED --enable-preview -jar /opt/grimmory/dist/app.jar'
   systemctl daemon-reload
   systemctl disable --now booklore.service >/dev/null 2>&1 || true
 
@@ -242,6 +428,7 @@ function update_script() {
 
   sleep 2
   if ! systemctl is-active --quiet grimmory.service; then
+    journalctl -u grimmory.service -n 80 --no-pager || true
     msg_error "Grimmory service failed to start. Backups were retained."
     exit 1
   fi
