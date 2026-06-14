@@ -109,68 +109,6 @@ function upsert_service_line() {
   rm -f "$TMP"
 }
 
-
-function run_long_command() {
-  local NAME="$1"
-  shift
-  local LOG_FILE="/tmp/grimmory-${NAME}.log"
-  local PID
-  local RC
-  local OLD_HUP_TRAP
-  local OLD_ERREXIT="off"
-
-  msg_info "Running ${NAME} (log: ${LOG_FILE})"
-  rm -f "$LOG_FILE"
-
-  # community-scripts installs a SIGHUP trap. Angular builds can be quiet for long
-  # stretches, and in some LXC/helper contexts the child process gets HUP'd before
-  # it can print a real build error. Ignore HUP only while this long command runs.
-  OLD_HUP_TRAP="$(trap -p HUP || true)"
-  case "$-" in
-    *e*) OLD_ERREXIT="on" ;;
-  esac
-
-  trap '' HUP
-
-  (
-    trap '' HUP
-    echo "[$(date -Is)] Command: $*"
-    echo "[$(date -Is)] MemTotal: $(awk '/^MemTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
-    echo "[$(date -Is)] SwapTotal: $(awk '/^SwapTotal:/ {printf "%d MB", $2/1024}' /proc/meminfo 2>/dev/null || true)"
-    echo "[$(date -Is)] Disk free at /opt/grimmory: $(df -h /opt/grimmory 2>/dev/null | awk 'NR==2 {print $4 " free of " $2}' || true)"
-    exec nohup "$@" </dev/null
-  ) >"$LOG_FILE" 2>&1 &
-  PID=$!
-
-  while kill -0 "$PID" >/dev/null 2>&1; do
-    sleep 15
-    echo -n "."
-  done
-  echo
-
-  # Do not let set -e / ERR trap short-circuit our log printing.
-  set +e
-  wait "$PID"
-  RC=$?
-  if [[ "$OLD_ERREXIT" == "on" ]]; then
-    set -e
-  fi
-
-  if [[ -n "$OLD_HUP_TRAP" ]]; then
-    eval "$OLD_HUP_TRAP"
-  else
-    trap - HUP
-  fi
-
-  if [[ "$RC" -ne 0 ]]; then
-    msg_warn "${NAME} failed with exit code ${RC}; showing the last 200 log lines"
-    tail -n 200 "$LOG_FILE" || true
-    return "$RC"
-  fi
-
-  msg_ok "${NAME} completed"
-}
-
 function setup_kepubify() {
   local OLD_PATH="/opt/booklore_storage/data/tools/kepubify"
   local NEW_PATH="/usr/local/bin/kepubify"
