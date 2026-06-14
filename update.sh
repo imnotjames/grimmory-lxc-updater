@@ -315,70 +315,13 @@ function update_script() {
   msg_info "Downloading fresh source code (${GRIMMORY_VERSION})"
   rm -rf /opt/grimmory
   mkdir -p /opt/grimmory
-  
-  # Fetch the latest release tag instead of the moving main/develop branch.
-  TARBALL_URL="https://github.com/grimmory-tools/grimmory/archive/refs/tags/${GRIMMORY_VERSION}.tar.gz"
-  curl -fsSL "$TARBALL_URL" -o /tmp/grimmory.tar.gz
-  tar -xzf /tmp/grimmory.tar.gz -C /opt/grimmory --strip-components=1
-  rm -f /tmp/grimmory.tar.gz
 
-  # Frontend build:
-  msg_info "Building Frontend"
-  if [[ ! -d /opt/grimmory/frontend ]]; then
-    msg_error "Source directory /opt/grimmory/frontend does not exist after download!"
-    exit 1
-  fi
-  cd /opt/grimmory/frontend || exit 1
-  
-  rm -rf node_modules .angular/cache
-  corepack enable
-  $STD corepack prepare yarn@4.10.3 --activate
+  # Fetch the latest jar file
+  JAR_PATH=$(mktemp)
 
-  # Keep the install/build resilient inside pct/Proxmox helper sessions.
-  # The Dockerfile uses these same CI and Angular analytics flags for production builds.
-  if ! run_long_command frontend-install corepack yarn install --immutable; then
-    msg_error "Frontend dependency install failed. See /tmp/grimmory-frontend-install.log"
-    exit 1
-  fi
+  JAR_URL="https://github.com/grimmory-tools/grimmory/releases/download/${GRIMMORY_VERSION}/grimmory.jar"
+  curl -fsSL "${JAR_URL}" -o "${JAR_PATH}"
 
-  local MEM_MB
-  local NODE_HEAP_MB
-  MEM_MB="$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)"
-  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB > 0 )); then
-    NODE_HEAP_MB=$((MEM_MB * 55 / 100))
-    (( NODE_HEAP_MB < 2048 )) && NODE_HEAP_MB=2048
-    (( NODE_HEAP_MB > 4096 )) && NODE_HEAP_MB=4096
-  else
-    NODE_HEAP_MB=3072
-  fi
-
-  if [[ "$MEM_MB" =~ ^[0-9]+$ ]] && (( MEM_MB < 4096 )); then
-    msg_warn "Detected only ${MEM_MB} MB RAM. Grimmory 3.2.0 frontend builds may need at least 4 GB; 6 GB is safer."
-  fi
-
-  export NODE_OPTIONS="--max-old-space-size=${NODE_HEAP_MB}"
-  export YARN_ENABLE_TELEMETRY=0
-  export CI=1
-  export NG_CLI_ANALYTICS=false
-  export NG_BUILD_MAX_WORKERS=2
-
-  if ! run_long_command frontend-build corepack yarn ng build --configuration production --progress=false; then
-    msg_error "Frontend build failed. See /tmp/grimmory-frontend-build.log"
-    exit 1
-  fi
-
-  unset CI NG_CLI_ANALYTICS YARN_ENABLE_TELEMETRY NODE_OPTIONS NG_BUILD_MAX_WORKERS
-  msg_ok "Built Frontend"
-
-  # Backend build:
-  msg_info "Building Backend"
-  cd /opt/grimmory/backend || exit 1
-  export APP_VERSION="${GRIMMORY_VERSION}"
-  export APP_REVISION="${GRIMMORY_REVISION}"
-  $STD ./gradlew clean bootJar -PfrontendDistDir=/opt/grimmory/frontend/dist/grimmory/browser -x test --no-daemon
-
-  mkdir -p /opt/grimmory/dist
-  JAR_PATH=$(find /opt/grimmory/backend/build/libs -maxdepth 1 -type f -name "*.jar" ! -name "*plain*" | head -n1)
   if [[ -z "$JAR_PATH" ]]; then
     msg_error "Backend JAR not found"
     exit
